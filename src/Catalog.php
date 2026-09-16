@@ -25,6 +25,15 @@ namespace WISECP\Modules\Addons\ProductCatalog\Src;
 
 final class Catalog
 {
+    /**
+     * Endpoint payloads are cached through the core Cache (file backed,
+     * Cache::remember) so catalog reads do not hit the database on every
+     * request. The cache refreshes after CACHE_TTL seconds, and hooks.php
+     * clears it the moment a product or category changes in the panel.
+     */
+    public const CACHE_GROUP = 'productcatalog';
+    public const CACHE_TTL   = 86400; // 24 hours
+
     /** Core cycle names, in display order. */
     public const CYCLE_ORDER = [
         'hourly', 'daily', 'weekly', 'monthly', 'quarterly', 'semiannually',
@@ -318,16 +327,17 @@ final class Catalog
         $pid  = (int) ($row['id'] ?? 0);
         $type = (string) ($row['type'] ?? 'hosting');
 
+        // JSON columns arrive as strings; decode the known ones for output.
+        $jsonKeys = ['options', 'additional_tax', 'module_data'];
+
         $out = [];
-        foreach ($row as $key => $value) {
-            if ($key === 'options')
-                $out[$key] = \Utility::jdecode((string) $value, true) ?: [];
-            else
-                $out[$key] = $value;
-        }
-        $out['created_at'] = ((int) ($row['ctime'] ?? 0)) > 0
-            ? date('Y-m-d H:i:s', (int) $row['ctime'])
-            : '';
+        foreach ($row as $key => $value)
+            $out[$key] = in_array($key, $jsonKeys, true)
+                ? (\Utility::jdecode((string) $value, true) ?: $value)
+                : $value;
+
+        // ctime is already a DATETIME string in this table.
+        $out['created_at'] = (string) ($row['ctime'] ?? '');
 
         // Language pack, keyed by lang exactly like the admin detail API.
         $out['langs'] = [];
@@ -379,8 +389,11 @@ final class Catalog
 
         $out['link'] = (string) \LinkGenerator::client('configure', [$type, $pid]);
 
+        // LinkGenerator usually returns an absolute URL; only prefix the
+        // configured site URL when the link is relative, never on top of one.
         $siteUrl = trim((string) ($options['site_url'] ?? ''), " /");
-        $out['order_url'] = $siteUrl !== ''
+        $isAbsolute = (bool) preg_match('#^https?://#i', $out['link']);
+        $out['order_url'] = (!$isAbsolute && $siteUrl !== '')
             ? $siteUrl . '/' . ltrim($out['link'], '/')
             : $out['link'];
 
@@ -405,8 +418,20 @@ final class Catalog
      * The catalog list: every product, fully assembled. Mirrors the core list
      * envelope: page/limit in, meta.total/page/limit/next_page out.
      * limit=0 (default) returns everything.
+     *
+     * Cached for CACHE_TTL (24h) in the core Cache; hooks.php clears the
+     * group whenever a product or category changes, so panel edits show up
+     * immediately and the TTL is only the backstop.
      */
     public static function catalog(array $filters = []): array
+    {
+        $key = 'catalog_' . md5((string) json_encode([$filters, \Language::selected()]));
+
+        return \Cache::remember(self::CACHE_GROUP, $key, self::CACHE_TTL,
+            static fn (): array => self::catalog_fresh($filters));
+    }
+
+    private static function catalog_fresh(array $filters): array
     {
         $context = self::context($filters);
         $rows    = self::product_rows($filters);
@@ -452,8 +477,16 @@ final class Catalog
         ];
     }
 
-    /** One assembled product, or null. */
+    /** One assembled product, or null. Cached like the catalog list. */
     public static function product(int $id, array $filters = []): ?array
+    {
+        $key = 'product_' . (int) $id . '_' . md5((string) json_encode([$filters, \Language::selected()]));
+
+        return \Cache::remember(self::CACHE_GROUP, $key, self::CACHE_TTL,
+            static fn (): ?array => self::product_fresh($id, $filters));
+    }
+
+    private static function product_fresh(int $id, array $filters = []): ?array
     {
         $context = self::context($filters);
 
@@ -472,8 +505,16 @@ final class Catalog
         return self::assemble($row, $langs[$pid] ?? [], $prices[$pid] ?? [], $context['categories'], $context);
     }
 
-    /** Categories with their product counts. */
+    /** Categories with their product counts. Cached like the catalog list. */
     public static function categories_detailed(array $filters = []): array
+    {
+        $key = 'categories_' . md5((string) json_encode([$filters, \Language::selected()]));
+
+        return \Cache::remember(self::CACHE_GROUP, $key, self::CACHE_TTL,
+            static fn (): array => self::categories_fresh($filters));
+    }
+
+    private static function categories_fresh(array $filters): array
     {
         $context = self::context($filters);
         $rows    = self::product_rows($filters);
@@ -500,6 +541,17 @@ final class Catalog
         }
 
         return ['data' => $list, 'meta' => ['total' => count($list), 'generated_at' => date('Y-m-d H:i:s')]];
+    }
+
+    /** Wipes every cached payload of this module (used by the panel hooks). */
+    public static function clear_cache(): void
+    {
+        try {
+            \Cache::getInstance()->clear(self::CACHE_GROUP);
+        }
+        catch (\Throwable $e) {
+            // A cache flush must never take a panel operation down with it.
+        }
     }
 
     /** Diagnostics for the token gated status endpoint. */
