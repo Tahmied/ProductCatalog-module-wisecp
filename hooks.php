@@ -1,28 +1,26 @@
 <?php
-/*
- * Product Catalog API — hook registrations.
+/**
+ * WISECP · Product Catalog API — hook registrations.
  *
- * This file is included on EVERY request for every module on disk, enabled or
- * not, so it stays a registration list: no work beyond the includes, the route
- * listener and the catalogue publish.
+ * This file is included on EVERY request for every module on disk, so it
+ * stays a registration list. The routes are only registered while the addon
+ * is enabled — the same pattern the shipped WChat addon uses — so a disabled
+ * module leaves no endpoints on the router at all.
  */
 
-use WISECP\Modules\Addons\ProductCatalog\Src\ApiSurface;
+Modules::Load('Addons', 'ProductCatalog', true);
+$pc_config = Modules::Config('Addons', 'ProductCatalog') ?: [];
 
-include_once __DIR__ . DS . 'src' . DS . 'ApiSurface.php';
+if (($pc_config['status'] ?? false)) {
 
-/*
- * The addresses. The hook fires once per audience with the route list by
- * reference; this module only appends on the free surface, which answers on
- * /api/v1/{pattern} with no credential.
- */
-Hook::add('filter:api.routes', 20, function (&$routes, &$audience) {
-    if ($audience !== 'module') return;
+    Hook::add('filter:api.routes', 1, function (&$routes, &$audience) {
+        if ($audience !== 'module') return;
 
-    foreach (ApiSurface::routes() as $route)
-        $routes[] = $route;
-});
-
-// The API credentials screen checkboxes. In the file body, never inside the
-// listener above — the settings screen reads the catalogue before routes fire.
-ApiSurface::publish_permission_catalog();
+        // Literal paths before their parametric twin: the router takes the
+        // first match at a given segment count, so {id} must come last.
+        $routes[] = ['GET', 'products/catalog/categories', 'Module:Addons/ProductCatalog', 'categories',     true];
+        $routes[] = ['GET', 'products/catalog/status',     'Module:Addons/ProductCatalog', 'status',         true];
+        $routes[] = ['GET', 'products/catalog/{id}',       'Module:Addons/ProductCatalog', 'product_detail', true];
+        $routes[] = ['GET', 'products/catalog',            'Module:Addons/ProductCatalog', 'catalog',        true];
+    });
+}

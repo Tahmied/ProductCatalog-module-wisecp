@@ -1,348 +1,169 @@
 <?php
+/**
+ * WISECP · Product Catalog API — data layer.
+ *
+ * Reads products, per-cycle prices and currencies straight from the database
+ * with the core WDB builder, mirroring the queries the platform's own catalog
+ * runs (models/website/products.php, Products::catalog_prices_bulk()).
+ *
+ * Verified v5 schema this file is written against:
+ *   products        id, rank, type, category, categories(csv), group_type,
+ *                   group_id, status, visibility, override_usrcurrency,
+ *                   stock, options(JSON), module, ctime
+ *   products_lang   owner_id, lang, title, tagline, description, content,
+ *                   features, route, seo_*
+ *   categories      id, parent, type('products'), kind, rank, status,
+ *                   visibility, options
+ *   categories_lang owner_id, lang, title, sub_title, route, content, ...
+ *   prices          id, owner('products'), owner_id, type('periodicals'|'sale'),
+ *                   status(1), period('month','year','none',...), time(1,3,6,..),
+ *                   amount, setup, promotion, promotion_status, cid, rank
+ *   currencies      id, code, name, rate, status('active'), local(1=default)
+ */
+
 namespace WISECP\Modules\Addons\ProductCatalog\Src;
 
-/**
- * Reads the product catalog — products, per-cycle prices and currencies —
- * straight from the database through the core WDB query builder.
- *
- * The admin API answers products and products/{id} without any price data, so
- * this class performs the same read the panel does and joins the pricing
- * tables on top.
- *
- * Table and column names are resolved at runtime rather than hardcoded: the
- * schema pieces behind the product catalog have moved between WiseCP
- * releases, and a module that guesses one fixed name fails silently. For each
- * piece a priority-ordered candidate list is probed with WDB::hasTable() and
- * SHOW COLUMNS (the two discovery primitives the module guide documents) and
- * the first match wins. describe() exposes what was resolved, and the token
- * gated status endpoint prints it so a mismatch can be diagnosed from the
- * outside without touching the installation.
- */
 final class Catalog
 {
-    /** Canonical display order for billing cycles. */
+    /** Core cycle names, in display order. */
     public const CYCLE_ORDER = [
-        'onetime', 'monthly', 'quarterly', 'semiannually', 'annually', 'biennially', 'triennially',
+        'hourly', 'daily', 'weekly', 'monthly', 'quarterly', 'semiannually',
+        'annually', 'biennially', 'triennially', 'onetime',
     ];
 
-    public const CYCLE_LABELS = [
-        'onetime'      => 'One Time',
-        'monthly'      => 'Monthly',
-        'quarterly'    => 'Quarterly',
-        'semiannually' => 'Semi-Annually',
-        'annually'     => 'Annually',
-        'biennially'   => 'Biennially',
-        'triennially'  => 'Triennially',
-    ];
-
-    /** How many months a canonical cycle covers; null = not recurring. */
+    /** Months covered by a cycle; used for the monthly-equivalent figure. */
     public const CYCLE_MONTHS = [
         'monthly' => 1, 'quarterly' => 3, 'semiannually' => 6,
         'annually' => 12, 'biennially' => 24, 'triennially' => 36,
     ];
-
-    /** Short suffix a price tag prints, e.g. "USD 4.90/mo". */
-    public const CYCLE_SUFFIX = [
-        'monthly' => '/mo', 'quarterly' => '/qtr', 'semiannually' => '/6mo',
-        'annually' => '/yr', 'biennially' => '/2yr', 'triennially' => '/3yr',
-    ];
-
-    /** Raw cycle spellings seen in billing schemas, mapped onto canonical keys. */
-    private const CYCLE_ALIASES = [
-        'onetime' => 'onetime', 'one_time' => 'onetime', 'one time' => 'onetime', 'once' => 'onetime',
-        'none' => 'onetime', 'single' => 'onetime', 'ot' => 'onetime',
-
-        'monthly' => 'monthly', 'month' => 'monthly', 'm' => 'monthly', 'm1' => 'monthly', '1m' => 'monthly',
-        '1month' => 'monthly', 'per_month' => 'monthly',
-
-        'quarterly' => 'quarterly', 'quarter' => 'quarterly', 'q' => 'quarterly', 'q1' => 'quarterly',
-        'm3' => 'quarterly', '3m' => 'quarterly', '3months' => 'quarterly',
-
-        'semiannually' => 'semiannually', 'semiannual' => 'semiannually', 'semi_annually' => 'semiannually',
-        'semi' => 'semiannually', 'half_year' => 'semiannually', 'halfyear' => 'semiannually',
-        's' => 'semiannually', 's1' => 'semiannually', 'm6' => 'semiannually', '6m' => 'semiannually',
-        '6months' => 'semiannually',
-
-        'annually' => 'annually', 'annual' => 'annually', 'yearly' => 'annually', 'year' => 'annually',
-        'a' => 'annually', 'a1' => 'annually', 'y' => 'annually', 'y1' => 'annually',
-        'm12' => 'annually', '12m' => 'annually', '12months' => 'annually',
-
-        'biennially' => 'biennially', 'biennial' => 'biennially', 'biennium' => 'biennially',
-        'b' => 'biennially', 'b1' => 'biennially', 'y2' => 'biennially', '2y' => 'biennially',
-        'm24' => 'biennially', '24m' => 'biennially', '24months' => 'biennially',
-
-        'triennially' => 'triennially', 'triennial' => 'triennially',
-        't' => 'triennially', 't1' => 'triennially', 'y3' => 'triennially', '3y' => 'triennially',
-        'm36' => 'triennially', '36m' => 'triennially', '36months' => 'triennially',
-    ];
-
-    private const PRODUCT_TABLES  = ['products', 'product'];
-    private const PRICE_TABLES    = ['product_prices', 'products_prices', 'product_price', 'products_pricing', 'pricing', 'prices'];
-    private const CURRENCY_TABLES = ['currencies', 'currency'];
-    private const CATEGORY_TABLES = ['product_categories', 'products_categories', 'product_category', 'products_category', 'categories', 'category'];
-    private const LANG_TABLES     = ['products_lang', 'products_langs', 'product_lang', 'product_langs'];
-
-    /** Product row values that arrive as JSON strings and are decoded for output. */
-    private const JSON_FIELDS = [
-        'options', 'module_data', 'langs', 'additional_tax', 'prorate',
-        'recurring_cycles_limit', 'auto_terminate', 'upgradeable_product_ids',
-        'addon_ids', 'requirement_ids',
-    ];
-
-    private static array $tableCache = [];
-    private static array $colCache   = [];
-
-    // ------------------------------------------------------------------
-    // Schema discovery
-    // ------------------------------------------------------------------
-
-    /** First candidate table that exists in this installation, or null. */
-    public static function table(array $candidates): ?string
-    {
-        foreach ($candidates as $table) {
-            $key = strtolower((string) $table);
-
-            if (!array_key_exists($key, self::$tableCache))
-                self::$tableCache[$key] = (bool) \WDB::hasTable($table);
-
-            if (self::$tableCache[$key]) return (string) $table;
-        }
-
-        return null;
-    }
-
-    /** Lower-cased column names of a table, via SHOW COLUMNS. */
-    public static function columns(string $table): array
-    {
-        if (isset(self::$colCache[$table])) return self::$colCache[$table];
-
-        $cols = [];
-        $stmt = \WDB::query('SHOW COLUMNS FROM `' . str_replace('`', '', $table) . '`');
-
-        if ($stmt) {
-            while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
-                $field = (string) ($row['Field'] ?? $row['field'] ?? '');
-                if ($field !== '') $cols[] = strtolower($field);
-            }
-        }
-
-        return self::$colCache[$table] = $cols;
-    }
-
-    /** First candidate column that exists on the table. */
-    public static function pick(array $columns, array $candidates): ?string
-    {
-        foreach ($candidates as $candidate)
-            if (in_array(strtolower((string) $candidate), $columns, true))
-                return (string) $candidate;
-
-        return null;
-    }
-
-    /**
-     * Every row a built WDB statement holds. The builder's list accessor
-     * differs across releases (getAll, then a single-row getAssoc, then plain
-     * iteration); each is tried in that order so the read works on all of
-     * them.
-     */
-    private static function rows($stmt): array
-    {
-        if (!$stmt || !$stmt->build()) return [];
-
-        if (method_exists($stmt, 'getAll')) {
-            $rows = $stmt->getAll();
-            if (is_array($rows)) return $rows;
-        }
-
-        if (method_exists($stmt, 'getAssoc')) {
-            $first = $stmt->getAssoc();
-            if ($first) return [$first];
-        }
-
-        if ($stmt instanceof \Traversable) {
-            $rows = [];
-            foreach ($stmt as $row) $rows[] = (array) $row;
-            return $rows;
-        }
-
-        return [];
-    }
 
     // ------------------------------------------------------------------
     // Reference data
     // ------------------------------------------------------------------
 
     /**
-     * @return array id => ['id', 'code', 'rate', 'is_default']
+     * id => ['id','code','name','rate','is_local','status'] for every currency.
      */
-    public static function currencies(): array
+    private static function currencies(): array
     {
-        $table = self::table(self::CURRENCY_TABLES);
-        if (!$table) return [];
-
-        $cols    = self::columns($table);
-        $codeCol = self::pick($cols, ['code', 'iso', 'iso_code', 'currency_code', 'code_a', 'name', 'title']);
-        $rateCol = self::pick($cols, ['rate', 'exchange_rate', 'value', 'converter']);
-        $defCol  = self::pick($cols, ['default', 'is_default', 'is_default_currency', 'primary', 'main']);
-
-        $select = ['id'];
-        foreach ([$codeCol, $rateCol, $defCol] as $col)
-            if ($col) $select[] = '`' . $col . '`';
-
-        $stmt = \WDB::select(implode(', ', $select))->from($table)->orderBy('id', 'ASC');
+        static $cache = null;
+        if ($cache !== null) return $cache;
 
         $out = [];
-        foreach (self::rows($stmt) as $row) {
-            $id   = (int) ($row['id'] ?? 0);
-            $code = '';
-
-            if ($codeCol) {
-                foreach (['code', 'iso', 'iso_code', 'currency_code', 'code_a', 'name', 'title'] as $key)
-                    if (!empty($row[$key])) { $code = (string) $row[$key]; break; }
+        $stmt = \WDB::select('*')->from('currencies');
+        if ($stmt->build()) {
+            foreach ($stmt->fetch_assoc() as $row) {
+                $id = (int) ($row['id'] ?? 0);
+                $out[$id] = [
+                    'id'       => $id,
+                    'code'     => strtoupper((string) ($row['code'] ?? '')),
+                    'name'     => (string) ($row['name'] ?? ''),
+                    'rate'     => (float) ($row['rate'] ?? 1),
+                    'is_local' => (int) ($row['local'] ?? 0) === 1,
+                    'status'   => (string) ($row['status'] ?? ''),
+                ];
             }
+        }
 
-            $out[$id] = [
-                'id'         => $id,
-                'code'       => strtoupper($code),
-                'rate'       => $rateCol ? (float) ($row[$rateCol] ?? 1) : 1.0,
-                'is_default' => $defCol ? (bool) ($row[$defCol] ?? false) : false,
-            ];
+        return $cache = $out;
+    }
+
+    /** Currency id for a requested code; 0 falls back to the install default. */
+    private static function resolve_currency(string $code = ''): int
+    {
+        $currencies = self::currencies();
+
+        $want = strtoupper(trim($code));
+        if ($want !== '')
+            foreach ($currencies as $currency)
+                if ($currency['code'] === $want && $currency['status'] === 'active')
+                    return $currency['id'];
+
+        foreach ($currencies as $currency)
+            if ($currency['is_local']) return $currency['id'];
+
+        // Same fallback the platform uses when nothing is selected.
+        return (int) \Config::get('general/currency');
+    }
+
+    /**
+     * Categories of type 'products' with their language rows.
+     * id => ['id','rank','langs'=>[lang=>row]]
+     */
+    private static function categories(): array
+    {
+        static $cache = null;
+        if ($cache !== null) return $cache;
+
+        $out = [];
+        $stmt = \WDB::select('t1.*')
+            ->from('categories AS t1')
+            ->where('t1.type', '=', 'products')
+            ->order_by('t1.rank ASC, t1.id ASC');
+
+        foreach (($stmt->build() ? $stmt->fetch_assoc() : []) as $row) {
+            $id = (int) ($row['id'] ?? 0);
+            if ($id > 0) $out[$id] = ['id' => $id, 'rank' => (int) ($row['rank'] ?? 0), 'raw' => $row, 'langs' => []];
+        }
+
+        if ($out) {
+            $stmt = \WDB::select('*')->from('categories_lang')->where('owner_id', 'IN', array_keys($out));
+            foreach (($stmt->build() ? $stmt->fetch_assoc() : []) as $row) {
+                $owner = (int) ($row['owner_id'] ?? 0);
+                $lang  = (string) ($row['lang'] ?? '');
+                if (isset($out[$owner]) && $lang !== '') $out[$owner]['langs'][$lang] = $row;
+            }
+        }
+
+        return $cache = $out;
+    }
+
+    /**
+     * Product language rows grouped per product: productId => lang => row.
+     */
+    private static function product_langs(array $productIds): array
+    {
+        if (!$productIds) return [];
+
+        $stmt = \WDB::select('*')->from('products_lang')->where('owner_id', 'IN', array_values($productIds));
+
+        $out = [];
+        foreach (($stmt->build() ? $stmt->fetch_assoc() : []) as $row) {
+            $owner = (int) ($row['owner_id'] ?? 0);
+            $lang  = (string) ($row['lang'] ?? '');
+            if ($owner > 0 && $lang !== '') $out[$owner][$lang] = $row;
         }
 
         return $out;
     }
 
     /**
-     * @return array id => ['id', 'name', 'title']
+     * Every active price row of the given products, grouped per product.
+     * Mirrors Products::catalog_prices_bulk(): owner='products', status=1,
+     * ordered rank ASC. Includes both recurring ('periodicals') and one-time
+     * ('sale') rows.
      */
-    public static function categories(): array
+    private static function prices_bulk(array $productIds): array
     {
-        $table = self::table(self::CATEGORY_TABLES);
-        if (!$table) return [];
+        if (!$productIds) return [];
 
-        $cols     = self::columns($table);
-        $titleCol = self::pick($cols, ['title', 'name', 'category_name', 'label']);
-        $slugCol  = self::pick($cols, ['slug', 'route', 'seo_link']);
+        $ids  = array_values(array_unique(array_map('intval', $productIds)));
+        $stmt = \WDB::select('owner_id, period, time, amount, setup, promotion, promotion_status, cid, type')
+            ->from('prices')
+            ->where('owner', '=', 'products')
+            ->where('owner_id', 'IN', $ids)
+            ->whereGroup(function ($q) {
+                $q->where('type', '=', 'periodicals', '||');
+                $q->where('type', '=', 'sale');
+            }, '&&')
+            ->where('status', '=', 1)
+            ->order_by('rank ASC, id ASC');
 
-        $select = ['id'];
-        foreach ([$titleCol, $slugCol] as $col)
-            if ($col) $select[] = '`' . $col . '`';
+        $grouped = [];
+        foreach (($stmt->build() ? $stmt->fetch_assoc() : []) as $row)
+            $grouped[(int) $row['owner_id']][] = $row;
 
-        $order = self::pick($cols, ['rank', 'ordering', 'sort', 'order']);
-        $stmt  = \WDB::select(implode(', ', $select))->from($table);
-        $stmt  = $order ? $stmt->orderBy($order, 'ASC') : $stmt->orderBy('id', 'ASC');
-
-        $out = [];
-        foreach (self::rows($stmt) as $row) {
-            $id    = (int) ($row['id'] ?? 0);
-            $title = $titleCol ? (string) ($row[$titleCol] ?? '') : '';
-
-            // The admin API prints "title" on the list and "name" on the
-            // detail; both keys are carried so either consumer shape works.
-            $out[$id] = [
-                'id'    => $id,
-                'name'  => $title,
-                'title' => $title,
-            ] + ($slugCol ? ['slug' => (string) ($row[$slugCol] ?? '')] : []);
-        }
-
-        return $out;
-    }
-
-    /**
-     * Per-product language content, for installations that keep it in a
-     * separate table instead of a JSON column on the product row.
-     *
-     * @return array productId => langCode => decoded row
-     */
-    public static function product_langs(): array
-    {
-        $table = self::table(self::LANG_TABLES);
-        if (!$table) return [];
-
-        $cols    = self::columns($table);
-        $pidCol  = self::pick($cols, ['product_id', 'pid', 'productid', 'rel_id', 'relid', 'product']);
-        $langCol = self::pick($cols, ['lang', 'language', 'locale', 'code']);
-
-        if (!$pidCol) return [];
-
-        $stmt = \WDB::select('*')->from($table);
-
-        $out = [];
-        foreach (self::rows($stmt) as $row) {
-            $pid  = (int) ($row[$pidCol] ?? 0);
-            $code = $langCol ? (string) ($row[$langCol] ?? '') : 'en';
-            if ($pid <= 0) continue;
-
-            $entry = [];
-            foreach ($row as $key => $value)
-                if (!in_array($key, [$pidCol, $langCol], true))
-                    $entry[$key] = self::maybe_json($value);
-
-            $out[$pid][$code] = $entry;
-        }
-
-        return $out;
-    }
-
-    /**
-     * Every price row, normalised to productId => currencyId => cycle => amount.
-     *
-     * @return array [pid][currencyId][cycleKey] => ['price' => float, 'setup_fee' => float]
-     */
-    public static function prices(): array
-    {
-        $table = self::table(self::PRICE_TABLES);
-        if (!$table) return [];
-
-        $cols   = self::columns($table);
-        $pidCol = self::pick($cols, ['product_id', 'pid', 'productid', 'rel_id', 'relid', 'product']);
-        $curCol = self::pick($cols, ['currency_id', 'currencyid', 'currency']);
-        $cycCol = self::pick($cols, ['cycle', 'period', 'billing_cycle', 'term', 'duration', 'time']);
-        $amtCol = self::pick($cols, ['price', 'amount', 'total', 'value', 'cost']);
-        $setCol = self::pick($cols, ['setup_fee', 'setupfee', 'setup', 'init_fee', 'installation']);
-
-        if (!$pidCol || !$amtCol) return [];
-
-        $select = ['`' . $pidCol . '`', '`' . $amtCol . '`'];
-        foreach ([$curCol, $cycCol, $setCol] as $col)
-            if ($col) $select[] = '`' . $col . '`';
-
-        $stmt = \WDB::select(implode(', ', $select))->from($table);
-
-        $out = [];
-        foreach (self::rows($stmt) as $row) {
-            $pid   = (int) ($row[$pidCol] ?? 0);
-            $price = (float) ($row[$amtCol] ?? 0);
-            if ($pid <= 0) continue;
-
-            $curId = $curCol ? (int) ($row[$curCol] ?? 0) : 0;
-            $cycle = $cycCol ? self::cycle_key((string) ($row[$cycCol] ?? '')) : 'onetime';
-
-            $out[$pid][$curId][$cycle] = [
-                'price'     => $price,
-                'setup_fee' => $setCol ? (float) ($row[$setCol] ?? 0) : 0.0,
-            ];
-        }
-
-        return $out;
-    }
-
-    /** Raw cycle spelling to canonical key. */
-    public static function cycle_key(string $raw): string
-    {
-        $key = strtolower(trim($raw));
-
-        if (isset(self::CYCLE_ALIASES[$key])) return self::CYCLE_ALIASES[$key];
-
-        // Numeric month counts: 1, 3, 6, 12, 24, 36...
-        if (preg_match('/^(\d+)$/', $key, $m)) {
-            $months = (int) $m[1];
-            $byMonths = [1 => 'monthly', 3 => 'quarterly', 6 => 'semiannually', 12 => 'annually', 24 => 'biennially', 36 => 'triennially'];
-            return $byMonths[$months] ?? $key;
-        }
-
-        return $key !== '' ? $key : 'onetime';
+        return $grouped;
     }
 
     // ------------------------------------------------------------------
@@ -350,182 +171,229 @@ final class Catalog
     // ------------------------------------------------------------------
 
     /**
-     * Raw product rows after the configured filters.
+     * Product rows after the configured filters, ranked order.
      * Filters: status, visibility, category_id, type, search.
      */
-    public static function product_rows(array $filters = []): array
+    private static function product_rows(array $filters = []): array
     {
-        $table = self::table(self::PRODUCT_TABLES);
-        if (!$table)
-            throw new \RuntimeException('The product table could not be located in this installation. Check the status endpoint for what was found.');
+        $stmt = \WDB::select('t1.*')->from('products AS t1');
 
-        $cols = self::columns($table);
-        $stmt = \WDB::select('*')->from($table);
+        if (!empty($filters['status']))
+            $stmt->where('t1.status', '=', (string) $filters['status']);
 
-        if (!empty($filters['status']) && in_array('status', $cols, true))
-            $stmt->where('status', '=', (string) $filters['status']);
+        if (!empty($filters['visibility']))
+            $stmt->where('t1.visibility', '=', (string) $filters['visibility']);
 
-        if (!empty($filters['visibility']) && in_array('visibility', $cols, true))
-            $stmt->where('visibility', '=', (string) $filters['visibility']);
+        $categoryId = (int) ($filters['category_id'] ?? 0);
+        if ($categoryId > 0) {
+            // A product belongs to a category by id or by the csv `categories`
+            // column, exactly like the website catalog query.
+            $stmt->whereGroup(function ($q) use ($categoryId) {
+                $q->where('t1.category', '=', $categoryId, '||');
+                $q->where("FIND_IN_SET('" . $categoryId . "', t1.categories)", '', '');
+            }, '&&');
+        }
 
-        if (!empty($filters['category_id']) && in_array('category_id', $cols, true))
-            $stmt->where('category_id', '=', (int) $filters['category_id']);
-        elseif (!empty($filters['category_id']) && in_array('category', $cols, true))
-            $stmt->where('category', '=', (int) $filters['category_id']);
+        if (!empty($filters['type']))
+            $stmt->where('t1.type', '=', (string) $filters['type']);
 
-        if (!empty($filters['type']) && in_array('type', $cols, true))
-            $stmt->where('type', '=', (string) $filters['type']);
+        $stmt->order_by('t1.rank ASC, t1.id ASC');
 
-        if (!empty($filters['search']) && in_array('title', $cols, true))
-            $stmt->where('title', 'LIKE', '%' . (string) $filters['search'] . '%');
+        return $stmt->build() ? $stmt->fetch_assoc() : [];
+    }
 
-        $order = in_array('rank', $cols, true) ? 'rank' : 'id';
-        $stmt->orderBy($order, 'ASC')->orderBy('id', 'ASC');
+    // ------------------------------------------------------------------
+    // Assembly
+    // ------------------------------------------------------------------
 
-        return self::rows($stmt);
+    /** Preferred language row: selected language, then primary, then first. */
+    private static function pick_lang(array $langs): array
+    {
+        if (!$langs) return [];
+
+        $selected = (string) \Language::selected();
+        $primary  = (string) \Language::primary();
+
+        return $langs[$selected] ?? $langs[$primary] ?? reset($langs);
     }
 
     /**
-     * Full product records: the whole row (JSON columns decoded) plus the
-     * category, the language pack, prices for the selected currency, prices
-     * for every currency, a summary price block and order links.
+     * Resolves the price map for one product into the requested currency,
+     * following Products::plan_price_map(): products with
+     * override_usrcurrency=1 keep their own currency unconverted, everything
+     * else is exchanged into the display currency. Promotions resolve to the
+     * effective amount the way invoices do.
      *
-     * @param array $context context() output
+     * @return array [cycle => price row] plus '_cid' => display currency id
      */
-    public static function assemble(array $row, array $context): array
+    private static function resolve_prices(array $productRow, array $priceRows, int $displayCid): array
     {
-        $out = [];
+        $override  = (int) ($productRow['override_usrcurrency'] ?? 0) === 1;
+        $ownCid    = (int) ($priceRows[0]['cid'] ?? 0);
+        $outCid    = $override ? ($ownCid ?: $displayCid) : $displayCid;
+        $out       = [];
 
-        foreach ($row as $key => $value)
-            $out[$key] = in_array($key, self::JSON_FIELDS, true) ? self::maybe_json($value) : $value;
+        foreach ($priceRows as $row) {
+            $cycle = ((string) ($row['type'] ?? '')) === 'sale'
+                ? 'onetime'
+                : (string) \Products::cycle((string) ($row['time'] ?? ''), (string) ($row['period'] ?? ''));
 
-        $pid = (int) ($row['id'] ?? 0);
+            if ($cycle === '') continue;
 
-        // Language content: prefer the row's own pack, fall back to the
-        // separate language table when the installation keeps one.
-        if ((!isset($out['langs']) || !is_array($out['langs']) || $out['langs'] === []) && isset($context['langs'][$pid]))
-            $out['langs'] = $context['langs'][$pid];
+            $amount   = (float) ($row['amount'] ?? 0);
+            if ($amount <= 0) continue;
 
-        $catId = 0;
-        foreach (['category_id', 'category', 'catid'] as $key)
-            if (!empty($row[$key])) { $catId = (int) $row[$key]; break; }
+            $promo    = (float) ($row['promotion'] ?? 0);
+            $promoOn  = ((int) ($row['promotion_status'] ?? 0)) === 1 && $promo > 0 && $promo < $amount;
 
-        $out['category'] = $catId > 0 && isset($context['categories'][$catId])
-            ? $context['categories'][$catId]
-            : null;
+            $cid = (int) ($row['cid'] ?? 0);
+            if ($override) {
+                if ($cid !== $outCid) continue;
+            }
+            elseif ($cid && $outCid && $cid !== $outCid) {
+                $amount = (float) \Money::exChange($amount, $cid, $outCid);
+                if ($promoOn) $promo = (float) \Money::exChange($promo, $cid, $outCid);
+            }
 
-        // ---- prices -------------------------------------------------
-        $all        = $context['prices'][$pid] ?? [];
-        $selected   = $all[(int) $context['currency_id']] ?? [];
+            $effective  = $promoOn ? $promo : $amount;
+            $months     = self::CYCLE_MONTHS[$cycle] ?? null;
 
-        $out['prices'] = self::order_cycles($selected);
-
-        $perCurrency = [];
-        foreach ($all as $currencyId => $cycles) {
-            $code = (string) ($context['currencies'][(int) $currencyId]['code'] ?? 'currency-' . $currencyId);
-            $perCurrency[$code] = self::order_cycles($cycles);
+            $out[$cycle] = [
+                'amount'             => round($amount, 2),
+                'promotion'          => $promoOn ? round($promo, 2) : null,
+                'effective'          => round($effective, 2),
+                'setup'              => round((float) ($row['setup'] ?? 0), 2),
+                'formatted'          => \Money::formatter_symbol(round($effective, 2), $outCid),
+                'monthly_equivalent' => $months ? round($effective / $months, 2) : null,
+            ];
         }
-        $out['prices_all_currencies'] = $perCurrency;
 
-        // ---- summary price ------------------------------------------
-        $out['price'] = self::summary($out['prices'], (string) $context['currency_code']);
-
-        // ---- stock and order links ----------------------------------
-        $stock = $row['stock'] ?? null;
-        $out['in_stock'] = ($stock === null || $stock === '') ? true : ((int) $stock > 0);
-
-        $type = (string) ($row['type'] ?? 'hosting');
-        $out['order_path'] = 'configure/' . $type . '/' . $pid;
-
-        $siteUrl = trim((string) ($context['site_url'] ?? ''), " /");
-        $out['order_url'] = $siteUrl !== ''
-            ? $siteUrl . '/' . $out['order_path']
-            : null;
-
+        $out['_cid'] = $outCid;
         return $out;
-    }
-
-    /** context() carries the reference data one read instead of per product. */
-    public static function context(array $options = []): array
-    {
-        $currencies = self::currencies();
-
-        $currencyId = 0;
-        $wantCode   = strtoupper(trim((string) ($options['currency'] ?? '')));
-
-        if ($wantCode !== '') {
-            foreach ($currencies as $currency)
-                if ($currency['code'] === $wantCode) { $currencyId = $currency['id']; break; }
-        }
-
-        if ($currencyId === 0) {
-            foreach ($currencies as $currency)
-                if ($currency['is_default']) { $currencyId = $currency['id']; break; }
-        }
-
-        if ($currencyId === 0 && $currencies !== []) {
-            $first      = reset($currencies);
-            $currencyId = (int) $first['id'];
-        }
-
-        $currencyCode = (string) ($currencies[$currencyId]['code'] ?? ($wantCode !== '' ? $wantCode : ''));
-
-        return [
-            'currencies'    => $currencies,
-            'currency_id'   => $currencyId,
-            'currency_code' => $currencyCode,
-            'categories'    => self::categories(),
-            'langs'         => self::product_langs(),
-            'prices'        => self::prices(),
-            'site_url'      => (string) ($options['site_url'] ?? ''),
-        ];
     }
 
     /** Cycles in canonical order, unknown spellings appended behind them. */
     private static function order_cycles(array $cycles): array
     {
         $ordered = [];
-
         foreach (self::CYCLE_ORDER as $key)
             if (isset($cycles[$key])) $ordered[$key] = $cycles[$key];
-
         foreach ($cycles as $key => $value)
-            if (!isset($ordered[$key])) $ordered[$key] = $value;
-
+            if ($key !== '_cid' && !isset($ordered[$key])) $ordered[$key] = $value;
         return $ordered;
     }
 
-    /** The single "from" price a price tag prints, plus formatted strings. */
-    private static function summary(array $prices, string $currencyCode): ?array
+    /** The "from" price a price tag prints. */
+    private static function summary(array $prices, int $cid): array
     {
-        if ($prices === []) return null;
-
         $cycle = null;
         foreach (self::CYCLE_ORDER as $key)
             if (isset($prices[$key])) { $cycle = $key; break; }
 
-        if ($cycle === null) {
-            $keys  = array_keys($prices);
-            $cycle = (string) reset($keys);
-        }
+        if ($cycle === null) return [];
 
-        $amount   = (float) ($prices[$cycle]['price'] ?? 0);
-        $setupFee = (float) ($prices[$cycle]['setup_fee'] ?? 0);
-        $months   = self::CYCLE_MONTHS[$cycle] ?? null;
-        $suffix   = self::CYCLE_SUFFIX[$cycle] ?? '';
-
-        $formatted = number_format($amount, 2, '.', '');
-        $label     = self::CYCLE_LABELS[$cycle] ?? ucfirst($cycle);
+        $row = $prices[$cycle];
+        $suffix = (string) \Products::price_suffix($cycle, (float) $row['effective']);
 
         return [
-            'amount'             => $amount,
-            'setup_fee'          => $setupFee,
-            'cycle'              => $cycle,
-            'cycle_label'        => $label,
-            'currency'           => $currencyCode,
-            'formatted'          => trim($currencyCode . ' ' . $formatted),
-            'formatted_cycle'    => trim($currencyCode . ' ' . $formatted) . $suffix,
-            'monthly_equivalent' => $months ? round($amount / $months, 2) : null,
+            'cycle'       => $cycle,
+            'amount'      => $row['amount'],
+            'effective'   => $row['effective'],
+            'promotion'   => $row['promotion'],
+            'setup'       => $row['setup'],
+            'currency'    => \Money::currency_code($cid),
+            'currency_id' => $cid,
+            'formatted'   => \Money::formatter_symbol((float) $row['effective'], $cid),
+            'suffix'      => $suffix,
+            'monthly_equivalent' => $row['monthly_equivalent'],
+        ];
+    }
+
+    /**
+     * Full product record: every column of the row (JSON decoded), the
+     * language pack, the category, resolved prices, stock and order links.
+     */
+    private static function assemble(array $row, array $langs, array $prices, array $categories, array $options): array
+    {
+        $pid  = (int) ($row['id'] ?? 0);
+        $type = (string) ($row['type'] ?? 'hosting');
+
+        $out = [];
+        foreach ($row as $key => $value) {
+            if ($key === 'options')
+                $out[$key] = \Utility::jdecode((string) $value, true) ?: [];
+            else
+                $out[$key] = $value;
+        }
+        $out['created_at'] = ((int) ($row['ctime'] ?? 0)) > 0
+            ? date('Y-m-d H:i:s', (int) $row['ctime'])
+            : '';
+
+        // Language pack, keyed by lang exactly like the admin detail API.
+        $out['langs'] = [];
+        foreach ($langs as $lang => $langRow) {
+            unset($langRow['id'], $langRow['owner_id'], $langRow['lang']);
+
+            $out['langs'][$lang] = array_map(
+                static fn ($v) => is_string($v) && $v !== '' && ($v[0] === '{' || $v[0] === '[')
+                    ? (\Utility::jdecode($v, true) ?: $v)
+                    : $v,
+                $langRow
+            );
+        }
+
+        // Flat convenience fields for the display language.
+        $display = self::pick_lang($langs);
+        $out['title']    = (string) ($display['title'] ?? '');
+        $out['tagline']  = (string) ($display['tagline'] ?? '');
+        $out['features'] = (string) ($display['features'] ?? '');
+
+        // Category.
+        $catId = (int) ($row['category'] ?? 0);
+        $cat   = $categories[$catId] ?? null;
+        $out['category'] = null;
+        if ($cat) {
+            $catDisplay = self::pick_lang($cat['langs']);
+            $out['category'] = [
+                'id'    => $cat['id'],
+                'name'  => (string) ($catDisplay['title'] ?? ''),
+                'title' => (string) ($catDisplay['title'] ?? ''),
+                'route' => (string) ($catDisplay['route'] ?? ''),
+                'langs' => $cat['langs'],
+            ];
+        }
+
+        // Prices.
+        $resolved = self::resolve_prices($row, $prices, (int) $options['currency_id']);
+        $cid      = (int) ($resolved['_cid'] ?? $options['currency_id']);
+        unset($resolved['_cid']);
+
+        $out['prices']        = self::order_cycles($resolved);
+        $out['price']         = self::summary($out['prices'], $cid);
+        $out['currency']      = \Money::currency_code($cid);
+        $out['currency_id']   = $cid;
+
+        // Stock and order links.
+        $stock = (string) ($row['stock'] ?? '');
+        $out['in_stock'] = ($stock === '' || (int) $stock > 0);
+
+        $out['link'] = (string) \LinkGenerator::client('configure', [$type, $pid]);
+
+        $siteUrl = trim((string) ($options['site_url'] ?? ''), " /");
+        $out['order_url'] = $siteUrl !== ''
+            ? $siteUrl . '/' . ltrim($out['link'], '/')
+            : $out['link'];
+
+        return $out;
+    }
+
+    /** Everything the endpoints need resolved once, not per product. */
+    private static function context(array $filters): array
+    {
+        return [
+            'currency_id' => self::resolve_currency((string) ($filters['currency'] ?? '')),
+            'categories'  => self::categories(),
+            'site_url'    => (string) ($filters['site_url'] ?? ''),
         ];
     }
 
@@ -534,36 +402,40 @@ final class Catalog
     // ------------------------------------------------------------------
 
     /**
-     * The catalog list endpoint: every product, fully assembled.
-     * Mirrors the core list envelope: page/limit in, meta.total/page/limit/
-     * next_page out. A limit of 0 returns everything (the point of this API).
+     * The catalog list: every product, fully assembled. Mirrors the core list
+     * envelope: page/limit in, meta.total/page/limit/next_page out.
+     * limit=0 (default) returns everything.
      */
     public static function catalog(array $filters = []): array
     {
         $context = self::context($filters);
         $rows    = self::product_rows($filters);
 
-        $products = [];
-        foreach ($rows as $row)
-            $products[] = self::assemble((array) $row, $context);
+        $ids   = array_map(static fn ($r) => (int) ($r['id'] ?? 0), $rows);
+        $langs = self::product_langs($ids);
+        $prices = self::prices_bulk($ids);
 
-        $page    = max(1, (int) ($filters['page'] ?? 1));
-        $limit   = (int) ($filters['limit'] ?? 0);
-        $total   = count($products);
+        $products = [];
+        foreach ($rows as $row) {
+            $pid = (int) ($row['id'] ?? 0);
+            $products[] = self::assemble($row, $langs[$pid] ?? [], $prices[$pid] ?? [], $context['categories'], $context);
+        }
+
+        $total  = count($products);
+        $page   = max(1, (int) ($filters['page'] ?? 1));
+        $limit  = (int) ($filters['limit'] ?? 0);
 
         if ($limit > 0)
             $products = array_slice($products, ($page - 1) * $limit, $limit);
 
-        $nextPage = ($limit > 0 && $page * $limit < $total) ? $page + 1 : 0;
-
-        $present = [];
+        $cycles = [];
         foreach ($products as $product)
             foreach (array_keys($product['prices'] ?? []) as $cycle)
-                $present[$cycle] = true;
+                $cycles[$cycle] = true;
 
-        $cycles = array_values(array_intersect(self::CYCLE_ORDER, array_keys($present)));
-        foreach (array_keys($present) as $cycle)
-            if (!in_array($cycle, $cycles, true)) $cycles[] = $cycle;
+        $present    = array_keys($cycles);
+        $canonical  = array_values(array_intersect(self::CYCLE_ORDER, $present));
+        $extra      = array_values(array_diff($present, self::CYCLE_ORDER));
 
         return [
             'data' => $products,
@@ -571,10 +443,10 @@ final class Catalog
                 'total'            => $total,
                 'page'             => $page,
                 'limit'            => $limit > 0 ? $limit : $total,
-                'next_page'        => $nextPage,
-                'currency'         => $context['currency_code'],
-                'currency_id'      => $context['currency_id'],
-                'cycles_available' => $cycles,
+                'next_page'        => ($limit > 0 && $page * $limit < $total) ? $page + 1 : 0,
+                'currency'         => \Money::currency_code((int) $context['currency_id']),
+                'currency_id'      => (int) $context['currency_id'],
+                'cycles_available' => array_merge($canonical, $extra),
                 'generated_at'     => date('Y-m-d H:i:s'),
             ],
         ];
@@ -584,16 +456,23 @@ final class Catalog
     public static function product(int $id, array $filters = []): ?array
     {
         $context = self::context($filters);
-        $rows    = self::product_rows($filters);
 
-        foreach ($rows as $row)
-            if ((int) ($row['id'] ?? 0) === $id)
-                return self::assemble((array) $row, $context);
+        $stmt = \WDB::select('t1.*')->from('products AS t1')->where('t1.id', '=', $id);
+        $row  = $stmt->build() ? $stmt->getAssoc() : [];
+        if (!$row) return null;
 
-        return null;
+        // Respect the visibility filters for detail requests too.
+        if (!empty($filters['status']) && (string) ($row['status'] ?? '') !== (string) $filters['status']) return null;
+        if (!empty($filters['visibility']) && (string) ($row['visibility'] ?? '') !== (string) $filters['visibility']) return null;
+
+        $pid    = (int) ($row['id'] ?? 0);
+        $langs  = self::product_langs([$pid]);
+        $prices = self::prices_bulk([$pid]);
+
+        return self::assemble($row, $langs[$pid] ?? [], $prices[$pid] ?? [], $context['categories'], $context);
     }
 
-    /** Categories with their active product counts. */
+    /** Categories with their product counts. */
     public static function categories_detailed(array $filters = []): array
     {
         $context = self::context($filters);
@@ -601,78 +480,47 @@ final class Catalog
 
         $counts = [];
         foreach ($rows as $row) {
-            $catId = 0;
-            foreach (['category_id', 'category', 'catid'] as $key)
-                if (!empty($row[$key])) { $catId = (int) $row[$key]; break; }
-            $counts[$catId] = ($counts[$catId] ?? 0) + 1;
+            $catId = (int) ($row['category'] ?? 0);
+            if ($catId > 0) $counts[$catId] = ($counts[$catId] ?? 0) + 1;
+            foreach (array_filter(explode(',', (string) ($row['categories'] ?? ''))) as $extra)
+                if ((int) $extra > 0) $counts[(int) $extra] = ($counts[(int) $extra] ?? 0) + 1;
         }
 
         $list = [];
-        foreach ($context['categories'] as $category)
-            $list[] = $category + ['products_count' => $counts[$category['id']] ?? 0];
-
-        return ['data' => $list, 'meta' => ['total' => count($list)]];
-    }
-
-    /**
-     * What schema discovery resolved on this installation. Printed only by
-     * the token gated status endpoint.
-     */
-    public static function describe(): array
-    {
-        $productTable = self::table(self::PRODUCT_TABLES);
-        $priceTable   = self::table(self::PRICE_TABLES);
-        $currencyTab  = self::table(self::CURRENCY_TABLES);
-        $categoryTab  = self::table(self::CATEGORY_TABLES);
-        $langTable    = self::table(self::LANG_TABLES);
-
-        $describe = [
-            'php'            => PHP_VERSION,
-            'generated_at'   => date('Y-m-d H:i:s'),
-            'tables'         => [
-                'products'  => $productTable,
-                'prices'    => $priceTable,
-                'currencies'=> $currencyTab,
-                'categories'=> $categoryTab,
-                'languages' => $langTable,
-            ],
-            'product_columns'=> $productTable ? self::columns($productTable) : [],
-        ];
-
-        if ($priceTable) {
-            $cols        = self::columns($priceTable);
-            $describe['price_columns'] = [
-                'table'        => $priceTable,
-                'product'      => self::pick($cols, ['product_id', 'pid', 'productid', 'rel_id', 'relid', 'product']),
-                'currency'     => self::pick($cols, ['currency_id', 'currencyid', 'currency']),
-                'cycle'        => self::pick($cols, ['cycle', 'period', 'billing_cycle', 'term', 'duration', 'time']),
-                'amount'       => self::pick($cols, ['price', 'amount', 'total', 'value', 'cost']),
-                'setup_fee'    => self::pick($cols, ['setup_fee', 'setupfee', 'setup', 'init_fee', 'installation']),
+        foreach ($context['categories'] as $category) {
+            $display = self::pick_lang($category['langs']);
+            $list[] = [
+                'id'             => $category['id'],
+                'name'           => (string) ($display['title'] ?? ''),
+                'title'          => (string) ($display['title'] ?? ''),
+                'route'          => (string) ($display['route'] ?? ''),
+                'products_count' => $counts[$category['id']] ?? 0,
+                'langs'          => $category['langs'],
             ];
         }
 
-        $context = self::context();
-        $describe['currency'] = $context['currency_code'];
-        $describe['counts']   = [
-            'products'   => count(self::product_rows()),
-            'currencies' => count($context['currencies']),
-            'categories' => count($context['categories']),
-        ];
-
-        return $describe;
+        return ['data' => $list, 'meta' => ['total' => count($list), 'generated_at' => date('Y-m-d H:i:s')]];
     }
 
-    /** Decode a JSON string column; anything else passes through untouched. */
-    private static function maybe_json($value)
+    /** Diagnostics for the token gated status endpoint. */
+    public static function describe(array $filters = []): array
     {
-        if (is_string($value)) {
-            $trimmed = ltrim($value);
-            if ($trimmed !== '' && ($trimmed[0] === '{' || $trimmed[0] === '[')) {
-                $decoded = \Utility::jdecode($value, true);
-                if (is_array($decoded)) return $decoded;
-            }
-        }
+        $context   = self::context($filters);
+        $rows      = self::product_rows($filters);
+        $ids       = array_map(static fn ($r) => (int) ($r['id'] ?? 0), $rows);
+        $priceRows = self::prices_bulk($ids);
 
-        return $value;
+        return [
+            'php'          => PHP_VERSION,
+            'currency'     => \Money::currency_code((int) $context['currency_id']),
+            'currency_id'  => (int) $context['currency_id'],
+            'counts'       => [
+                'products'      => count($rows),
+                'with_prices'   => count($priceRows),
+                'currencies'    => count(self::currencies()),
+                'categories'    => count($context['categories']),
+                'price_rows'    => array_sum(array_map('count', $priceRows)),
+            ],
+        ];
     }
 }
