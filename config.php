@@ -13,7 +13,7 @@ return [
     'created_at' => 1789555200,
     'meta' => [
         'name'     => 'Product Catalog API',
-        'version'  => '1.0.0',
+        'version'  => '1.1.0',
         'author'   => 'OgaHost',
         'logo'     => 'logo.png',
         'icon'     => 'bi bi-box-seam',

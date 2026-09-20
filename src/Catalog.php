@@ -34,6 +34,13 @@ final class Catalog
     public const CACHE_GROUP = 'productcatalog';
     public const CACHE_TTL   = 86400; // 24 hours
 
+    /**
+     * Bump when the response payload shape changes (e.g. the discount field).
+     * It is part of every cache key, so a new module build never reads
+     * payloads cached by an older build — no manual cache flush on deploy.
+     */
+    public const CACHE_VERSION = '2';
+
     /** Core cycle names, in display order. */
     public const CYCLE_ORDER = [
         'hourly', 'daily', 'weekly', 'monthly', 'quarterly', 'semiannually',
@@ -152,12 +159,36 @@ final class Catalog
      * ordered rank ASC. Includes both recurring ('periodicals') and one-time
      * ('sale') rows.
      */
+    /** Lower-cased column names of a table, via SHOW COLUMNS (cached per request). */
+    private static function columns(string $table): array
+    {
+        static $cache = [];
+        if (isset($cache[$table])) return $cache[$table];
+
+        $cols = [];
+        $stmt = \WDB::query('SHOW COLUMNS FROM `' . str_replace('`', '', $table) . '`');
+        if ($stmt) {
+            while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+                $field = (string) ($row['Field'] ?? '');
+                if ($field !== '') $cols[] = strtolower($field);
+            }
+        }
+
+        return $cache[$table] = $cols;
+    }
+
     private static function prices_bulk(array $productIds): array
     {
         if (!$productIds) return [];
 
         $ids  = array_values(array_unique(array_map('intval', $productIds)));
-        $stmt = \WDB::select('owner_id, period, time, amount, setup, promotion, promotion_status, cid, type')
+
+        // `discount` is a display-only percentage (admin "Discount (%)" field,
+        // no effect on the amounts). Older schemas may not have the column.
+        $cols = self::columns('prices');
+        $discountSql = in_array('discount', $cols, true) ? ', discount' : '';
+
+        $stmt = \WDB::select('owner_id, period, time, amount, setup, promotion, promotion_status, cid, type' . $discountSql)
             ->from('prices')
             ->where('owner', '=', 'products')
             ->where('owner_id', 'IN', $ids)
@@ -272,6 +303,7 @@ final class Catalog
                 'promotion'          => $promoOn ? round($promo, 2) : null,
                 'effective'          => round($effective, 2),
                 'setup'              => round((float) ($row['setup'] ?? 0), 2),
+                'discount'           => max(0.0, (float) ($row['discount'] ?? 0)),
                 'formatted'          => \Money::formatter_symbol(round($effective, 2), $outCid),
                 'monthly_equivalent' => $months ? round($effective / $months, 2) : null,
             ];
@@ -425,7 +457,7 @@ final class Catalog
      */
     public static function catalog(array $filters = []): array
     {
-        $key = 'catalog_' . md5((string) json_encode([$filters, \Language::selected()]));
+        $key = self::CACHE_VERSION . '_catalog_' . md5((string) json_encode([$filters, \Language::selected()]));
 
         return \Cache::remember(self::CACHE_GROUP, $key, self::CACHE_TTL,
             static fn (): array => self::catalog_fresh($filters));
@@ -480,7 +512,7 @@ final class Catalog
     /** One assembled product, or null. Cached like the catalog list. */
     public static function product(int $id, array $filters = []): ?array
     {
-        $key = 'product_' . (int) $id . '_' . md5((string) json_encode([$filters, \Language::selected()]));
+        $key = self::CACHE_VERSION . '_product_' . (int) $id . '_' . md5((string) json_encode([$filters, \Language::selected()]));
 
         return \Cache::remember(self::CACHE_GROUP, $key, self::CACHE_TTL,
             static fn (): ?array => self::product_fresh($id, $filters));
@@ -508,7 +540,7 @@ final class Catalog
     /** Categories with their product counts. Cached like the catalog list. */
     public static function categories_detailed(array $filters = []): array
     {
-        $key = 'categories_' . md5((string) json_encode([$filters, \Language::selected()]));
+        $key = self::CACHE_VERSION . '_categories_' . md5((string) json_encode([$filters, \Language::selected()]));
 
         return \Cache::remember(self::CACHE_GROUP, $key, self::CACHE_TTL,
             static fn (): array => self::categories_fresh($filters));
